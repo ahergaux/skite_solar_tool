@@ -6,6 +6,21 @@ from logger import get_logger
 
 log = get_logger("host_llm")
 
+# Canonical flat schema — every CSV row must have exactly these columns in this order
+CANONICAL_COLUMNS = [
+    "nature",
+    "title",
+    "institution",
+    "release",
+    "amount",
+    "beneficiary_type",
+    "sector",
+    "location",
+    "requirements",
+]
+
+# Threads alloués à chaque appel ollama (i5 = 4 cœurs / 8 threads avec HT)
+OLLAMA_NUM_THREAD = 8
 
 RELEVANCE_PROMPT = """
 Tu es un système de décision binaire spécialisé dans l'évaluation d'offres de financement pour startups.
@@ -61,68 +76,53 @@ CONTRAINTES DE SORTIE (CRITIQUES)
 """
 
 EXTRACTION_PROMPT = """
-You are a financial data extraction specialist. Extract structured information from the following funding offer text and return it as valid JSON.
+You are a financial data extraction specialist. Extract structured information from the following funding offer text and return it as a single flat JSON object.
 
 EXTRACTION INSTRUCTIONS:
 Return ONLY valid JSON with no additional text, markdown, or code blocks.
+All fields must be at the TOP LEVEL of the JSON object — no nested objects.
 
-FIELD DEFINITIONS AND FORMATTING REQUIREMENTS:
+FIELD DEFINITIONS:
 
-1. **nature** (string, lowercase, single value)
-   - Values: "subvention" | "pret" | "garantie" | "aide_fiscal" | "autre"
-   - If multiple types, choose the primary one
-   - Case: always lowercase, underscores for multi-word
+1. **nature** (string, lowercase)
+   Values: "subvention" | "pret" | "garantie" | "aide_fiscal" | "autre"
 
-2. **title** (string)
-   - Original program name in proper case (Title Case)
-   - Max 200 characters
-   - Preserve official acronyms (e.g., "FER", "KELIA", "GEDEON")
-   - Trim leading/trailing whitespace
+2. **title** (string, Title Case, max 200 chars)
+   Preserve official acronyms (e.g., "FER", "KELIA", "GEDEON")
 
-3. **release** (string, ISO 8601 format: YYYY-MM-DD)
-   - Publication or launch date
-   - If only month/year available, use first day of month (e.g., "2026-03-01")
-   - If only year available, use January 1st (e.g., "2026-01-01")
-   - If date not found, return null
+3. **institution** (string)
+   Name of the funding body / organisation behind the offer. null if unknown.
 
-4. **amount** (object with subfields)
-   - amount.min (number, nullable)
-   - amount.max (number, nullable)
-   - amount.currency (string: "EUR" | "GBP" | "USD" | other ISO 4217 codes)
-   - amount.unit (string: "euros" | "gbp" | "dollars" | lowercase full name)
-   - If single amount, set min and max to same value
-   - Strip all non-numeric characters (spaces, commas, periods for thousands)
-   - If currency is absent, assume "EUR"
-   - If amount not found, return null for entire object
+4. **release** (string, ISO 8601: YYYY-MM-DD)
+   Publication or launch date. If only month/year: first day of month. null if not found.
 
-5. **eligibility** (object with subfields)
-   - eligibility.beneficiary_type (array of strings, lowercase)
-     Values: "sme" | "startup" | "large_enterprise" | "non_profit" | "research_body" | "government" | "individual" | "other"
-   - eligibility.sector (array of strings, exact case as mentioned)
-     Examples: "Cleantech", "AI/LLM", "Biotech", "Agriculture", etc.
-     Include exact sector names from the text
-   - eligibility.location (array of strings, country codes: ISO 3166-1 alpha-2)
-     Examples: ["FR", "EU"] for France and EU-wide
-   - eligibility.requirements (string, plaintext summary, max 300 characters)
-     Key constraints or mandatory conditions in brief form
+5. **amount** (number)
+   Maximum funding amount as a plain integer (no currency symbol, no thousands separator).
+   Use the minimum if no maximum is given. null if not found.
 
-EXAMPLE JSON OUTPUT:
+6. **beneficiary_type** (array of strings, lowercase)
+   Values: "sme" | "startup" | "large_enterprise" | "non_profit" | "research_body" | "government" | "individual" | "other"
+
+7. **sector** (array of strings, exact case from text)
+   Examples: "Cleantech", "AI/LLM", "Biotech", "Agriculture"
+
+8. **location** (array of strings, ISO 3166-1 alpha-2 country codes)
+   Examples: ["FR"] for France, ["FR", "EU"] for EU-wide
+
+9. **requirements** (string, max 300 chars)
+   Key eligibility conditions in plain text. null if none found.
+
+EXAMPLE OUTPUT:
 {{
   "nature": "subvention",
   "title": "Programme d'Aide à l'Innovation",
+  "institution": "BPI France",
   "release": "2026-01-15",
-  "amount": {{
-    "min": 50000,
-    "max": 500000,
-    "currency": "EUR",
-    "unit": "euros"
-  }},
-  "eligibility": {{
-    "beneficiary_type": ["sme", "startup"],
-    "sector": ["AI/LLM", "Cleantech"],
-    "location": ["FR"],
-    "requirements": "Must be incorporated less than 5 years; minimum 2 employees; R&D expenditure >= 15% of turnover"
-  }}
+  "amount": 500000,
+  "beneficiary_type": ["sme", "startup"],
+  "sector": ["AI/LLM", "Cleantech"],
+  "location": ["FR"],
+  "requirements": "Incorporated less than 5 years; minimum 2 employees; R&D >= 15% of turnover"
 }}
 
 TEXT TO EXTRACT:
@@ -134,9 +134,14 @@ Return only the JSON object, no explanations or markdown formatting.
 
 class HostLLM:
 
-    def __init__(self, MODEL: str = "phi3.5"):
-        self.MODEL = MODEL
-        log.info(f"Initializing HostLLM with model '{MODEL}'")
+    def __init__(
+        self,
+        model_extract: str = "phi3.5",
+        model_relevance: str = "qwen2.5:0.5b",
+    ):
+        self.MODEL_EXTRACT = model_extract
+        self.MODEL_RELEVANCE = model_relevance
+        log.info(f"Initializing HostLLM — extract={model_extract!r}, relevance={model_relevance!r}")
         try:
             f = open("company_information.txt")
             self.company_informations = f.read()
@@ -144,16 +149,30 @@ class HostLLM:
         except FileNotFoundError:
             log.error("company_information.txt not found")
             self.company_informations = ""
+        self._verify_models()
         log.info("HostLLM initialized")
 
+    def _verify_models(self):
+        """Log a warning if a required model is not pulled yet."""
+        try:
+            available = {m.model for m in ollama.list().models}
+            for model in (self.MODEL_EXTRACT, self.MODEL_RELEVANCE):
+                if model not in available:
+                    log.error(
+                        f"Model {model!r} not found locally — run: ollama pull {model}"
+                    )
+        except Exception as e:
+            log.error(f"Could not list ollama models: {e}")
+
     def is_offer_relevant(self, offer_text: str) -> bool:
-        log.debug(f"is_offer_relevant called, offer length={len(offer_text)}")
+        log.debug(f"is_offer_relevant called with model={self.MODEL_RELEVANCE!r}, offer length={len(offer_text)}")
         prompt = RELEVANCE_PROMPT.replace("{offer_text}", offer_text)\
                                  .replace("{company_informations}", self.company_informations)
         try:
             response = ollama.chat(
-                model=self.MODEL,
+                model=self.MODEL_RELEVANCE,
                 messages=[{"role": "user", "content": prompt}],
+                options={"num_thread": OLLAMA_NUM_THREAD},
             )
         except Exception as e:
             log.error(f"ollama.chat (relevance) failed: {e}")
@@ -166,13 +185,14 @@ class HostLLM:
         return relevant
 
     def extract_information(self, offer_text: str) -> pd.DataFrame:
-        log.debug(f"extract_information called, offer length={len(offer_text)}")
+        log.debug(f"extract_information called with model={self.MODEL_EXTRACT!r}, offer length={len(offer_text)}")
         prompt = EXTRACTION_PROMPT.replace("{offer_text}", offer_text)
         try:
             response = ollama.chat(
-                model=self.MODEL,
+                model=self.MODEL_EXTRACT,
                 messages=[{"role": "user", "content": prompt}],
                 format="json",
+                options={"num_thread": OLLAMA_NUM_THREAD},
             )
         except Exception as e:
             log.error(f"ollama.chat (extraction) failed: {e}")
@@ -182,27 +202,67 @@ class HostLLM:
         log.debug(f"Extraction raw response: {raw!r:.300}")
 
         try:
-            data = self._extract_first_json(raw)
+            data = self._parse_json(raw)
         except ValueError as e:
             log.error(f"JSON extraction failed: {e} — raw output: {raw!r:.200}")
             return pd.DataFrame()
 
-        log.debug(f"Extracted data keys: {list(data.keys())}")
+        # Flatten legacy nested eligibility if the LLM still returns it
+        if isinstance(data.get("eligibility"), dict):
+            elig = data.pop("eligibility")
+            for key in ("beneficiary_type", "sector", "location", "requirements"):
+                if key not in data:
+                    data[key] = elig.get(key)
 
-        if data.get("amount"):
-            data["amount"] = data["amount"].get("max") or data["amount"].get("min")
-            log.debug(f"Amount resolved to: {data['amount']}")
+        # Flatten legacy nested amount if the LLM still returns it
+        if isinstance(data.get("amount"), dict):
+            amt = data["amount"]
+            data["amount"] = amt.get("max") or amt.get("min")
 
-        log.info(f"Extracted offer: title={data.get('title')!r}, nature={data.get('nature')!r}, amount={data.get('amount')}")
-        return pd.DataFrame([data])
+        # Enforce canonical schema: keep only known columns, fill missing with None
+        row = {col: data.get(col) for col in CANONICAL_COLUMNS}
 
-    def _extract_first_json(self, raw: str):
+        log.debug(f"Extracted data: {row}")
+        log.info(
+            f"Extracted offer: title={row.get('title')!r}, "
+            f"nature={row.get('nature')!r}, amount={row.get('amount')}"
+        )
+        return pd.DataFrame([row], columns=CANONICAL_COLUMNS)
+
+    def _parse_json(self, raw: str) -> dict:
+        """Parse the largest valid JSON object from a raw LLM string."""
+        # Strip markdown code fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
         raw = re.sub(r"\s*```$", "", raw)
-        matches = re.findall(r"\{.*?\}", raw, re.DOTALL)
-        for m in matches:
+
+        # Try the whole string first (fast path, avoids regex on nested structures)
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: find all {...} spans, pick the largest that parses
+        candidates = []
+        depth = 0
+        start = None
+        for i, ch in enumerate(raw):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(raw[start:i + 1])
+
+        for span in sorted(candidates, key=len, reverse=True):
             try:
-                return json.loads(m)
-            except Exception:
+                result = json.loads(span)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
                 continue
-        raise ValueError("No valid JSON found")
+
+        raise ValueError("No valid JSON object found in LLM output")

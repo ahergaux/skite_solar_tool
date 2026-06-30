@@ -1,4 +1,5 @@
 import os
+import subprocess
 from dotenv import load_dotenv
 from mail import iCloudConnection
 from llm import MistralConnection
@@ -8,6 +9,30 @@ from logger import get_logger
 
 log = get_logger("main")
 
+# Models used — pull them if missing
+MODELS_REQUIRED = ["phi3.5", "qwen2.5:0.5b"]
+
+
+def ensure_models():
+    """Pull any missing ollama model before the run starts."""
+    import ollama as _ollama
+    try:
+        available = {m.model for m in _ollama.list().models}
+    except Exception as e:
+        log.error(f"Could not query ollama model list: {e}")
+        return
+    for model in MODELS_REQUIRED:
+        if model not in available:
+            log.info(f"Model {model!r} not found locally — pulling...")
+            try:
+                subprocess.run(["ollama", "pull", model], check=True)
+                log.info(f"Model {model!r} pulled successfully")
+            except subprocess.CalledProcessError as e:
+                log.error(f"Failed to pull model {model!r}: {e}")
+        else:
+            log.debug(f"Model {model!r} already available")
+
+
 def main():
     log.info("=== Skite Solar Tool starting ===")
 
@@ -16,10 +41,17 @@ def main():
         raise RuntimeError(".env file not found or empty")
     log.debug(".env loaded successfully")
 
+    # These env vars configure the ollama *server* daemon.
+    # Set them before starting the ollama service, or add them to your shell profile.
+    # OLLAMA_NUM_PARALLEL=3   — concurrent requests the server handles
+    # OLLAMA_NUM_THREAD=8     — CPU threads per request (i5 = 8 with HT)
+    # OLLAMA_FLASH_ATTENTION=1 — enable Flash Attention if supported by model
+
+    ensure_models()
+
     log.info("Initializing clients...")
     mail_client = iCloudConnection()
     mistral_client = MistralConnection()
-    host_llm = HostLLM()
     check = ProcessCheck()
     log.info("All clients initialized")
 
@@ -52,6 +84,7 @@ def main():
         log.error("to_check.txt not found — skipping scrap processing")
 
     log.info(f"=== Run complete — {new_op} total new opportunities ===")
+
 
 if __name__ == "__main__":
     main()

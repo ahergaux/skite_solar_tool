@@ -1,11 +1,13 @@
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import ollama
 
-from host_llm import HostLLM
+from host_llm import HostLLM, OLLAMA_NUM_THREAD, CANONICAL_COLUMNS
 from logger import get_logger
 
 log = get_logger("process_check")
@@ -18,58 +20,104 @@ TITLE_MED_SIM  = 0.80
 INST_SIM       = 0.80
 AMOUNT_TOL     = 0.05
 
+# Parallel workers — 3 is a good balance on an i5 to leave headroom for the OS
+FILTER_WORKERS = 3
+
 
 class ProcessCheck:
 
     def __init__(self):
         log.info("Initializing ProcessCheck")
-        try:
-            self.offer_processed = pd.read_csv("offer_processed.csv")
-            log.debug(f"offer_processed.csv loaded ({len(self.offer_processed)} rows)")
-        except FileNotFoundError:
-            log.error("offer_processed.csv not found — starting with empty DataFrame")
-            self.offer_processed = pd.DataFrame()
-
-        try:
-            self.opportunities = pd.read_csv("opportunities.csv")
-            log.debug(f"opportunities.csv loaded ({len(self.opportunities)} rows)")
-        except FileNotFoundError:
-            log.error("opportunities.csv not found — starting with empty DataFrame")
-            self.opportunities = pd.DataFrame()
+        self.offer_processed = self._load_csv("offer_processed.csv")
+        self.opportunities = self._load_csv("opportunities.csv")
 
         self.llm = HostLLM()
+
+        # Thread-safe lock for CSV writes and DataFrame mutations
+        self._write_lock = threading.Lock()
+
+        # Embedding cache — avoids re-computing the same text twice
+        self._embed_cache: dict[str, np.ndarray] = {}
+        self._cache_lock = threading.Lock()
+
+        self._warmup_embed_cache()
         log.info("ProcessCheck initialized")
+
+    # ------------------------------------------------------------------
+    # CSV helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_csv(path: str) -> pd.DataFrame:
+        try:
+            df = pd.read_csv(path)
+            # Drop any columns that don't belong to the canonical schema
+            extra = [c for c in df.columns if c not in CANONICAL_COLUMNS]
+            if extra:
+                log.error(f"{path}: dropping unknown columns {extra} — schema mismatch detected")
+                df = df.drop(columns=extra)
+            # Add any missing canonical columns
+            for col in CANONICAL_COLUMNS:
+                if col not in df.columns:
+                    df[col] = None
+            df = df[CANONICAL_COLUMNS]
+            log.debug(f"{path} loaded ({len(df)} rows)")
+            return df
+        except FileNotFoundError:
+            log.info(f"{path} not found — creating empty file with canonical schema")
+            df = pd.DataFrame(columns=CANONICAL_COLUMNS)
+            df.to_csv(path, index=False)
+            return df
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def filter(self, offers: list) -> int:
-        log.info(f"filter() called with {len(offers)} offers")
+        log.info(f"filter() called with {len(offers)} offers — {FILTER_WORKERS} parallel workers")
         count = 0
-        for i, offer in enumerate(offers):
-            log.debug(f"Processing offer {i + 1}/{len(offers)}: {str(offer)!r:.100}")
 
-            extracted = self.llm.extract_information(offer)
-            if extracted.empty:
-                log.error(f"Extraction returned empty DataFrame for offer {i + 1} — skipping")
-                continue
-
-            if self.match(extracted, self.opportunities):
-                log.info(f"Offer {i + 1} already in opportunities — skipping")
-                continue
-
-            self.add_offer_processed(extracted)
-
-            if self.llm.is_offer_relevant(offer):
-                self.add_opportunity(extracted)
-                count += 1
-                log.info(f"Offer {i + 1} is relevant and added as opportunity (total so far: {count})")
-            else:
-                log.info(f"Offer {i + 1} is not relevant — not added to opportunities")
+        with ThreadPoolExecutor(max_workers=FILTER_WORKERS) as executor:
+            futures = {
+                executor.submit(self._process_one, i, offer): i
+                for i, offer in enumerate(offers)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    count += future.result()
+                except Exception as e:
+                    log.error(f"Unhandled error processing offer {idx + 1}: {e}")
 
         log.info(f"filter() done — {count} new opportunities added")
         return count
+
+    def _process_one(self, i: int, offer: str) -> int:
+        log.debug(f"Processing offer {i + 1}: {str(offer)!r:.100}")
+
+        extracted = self.llm.extract_information(offer)
+        if extracted.empty:
+            log.error(f"Extraction returned empty DataFrame for offer {i + 1} — skipping")
+            return 0
+
+        with self._write_lock:
+            already_known = self.match(extracted, self.opportunities)
+
+        if already_known:
+            log.info(f"Offer {i + 1} already in opportunities — skipping")
+            return 0
+
+        with self._write_lock:
+            self.add_offer_processed(extracted)
+
+        if self.llm.is_offer_relevant(offer):
+            with self._write_lock:
+                self.add_opportunity(extracted)
+            log.info(f"Offer {i + 1} is relevant — added as new opportunity")
+            return 1
+
+        log.info(f"Offer {i + 1} is not relevant — not added to opportunities")
+        return 0
 
     def match(self, offer: pd.DataFrame, db: pd.DataFrame) -> bool:
         """Return True if the offer is already present in db."""
@@ -132,17 +180,44 @@ class ProcessCheck:
     # Embedding helpers
     # ------------------------------------------------------------------
 
+    def _warmup_embed_cache(self):
+        """Pre-compute embeddings for all values already in the DB."""
+        if self.opportunities.empty:
+            return
+        cols = [c for c in ("title", "institution") if c in self.opportunities.columns]
+        values = set()
+        for col in cols:
+            values.update(self.opportunities[col].dropna().unique())
+        log.info(f"Warming up embedding cache for {len(values)} unique DB values...")
+        for val in values:
+            self._embed(str(val))
+        log.info(f"Embedding cache warm — {len(self._embed_cache)} entries")
+
     def _embed(self, text) -> np.ndarray:
         if text is None or (isinstance(text, float) and np.isnan(text)):
-            log.debug("_embed(): received None/NaN — returning zero vector")
             return np.zeros(1)
-        log.debug(f"_embed(): embedding text={str(text)!r:.60}")
+        key = str(text)
+        with self._cache_lock:
+            if key in self._embed_cache:
+                log.debug(f"_embed(): cache hit for {key!r:.60}")
+                return self._embed_cache[key]
+
+        log.debug(f"_embed(): computing embedding for {key!r:.60}")
         try:
-            response = ollama.embed(model=EMBED_MODEL, input=str(text))
-            return np.array(response.embeddings[0])
+            vec = np.array(
+                ollama.embed(
+                    model=EMBED_MODEL,
+                    input=key,
+                    options={"num_thread": OLLAMA_NUM_THREAD},
+                ).embeddings[0]
+            )
         except Exception as e:
-            log.error(f"_embed() failed for text={str(text)!r:.60}: {e}")
+            log.error(f"_embed() failed for {key!r:.60}: {e}")
             return np.zeros(1)
+
+        with self._cache_lock:
+            self._embed_cache[key] = vec
+        return vec
 
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
