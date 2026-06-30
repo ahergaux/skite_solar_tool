@@ -2,237 +2,62 @@ import json
 import re
 import pandas as pd
 import ollama
+from logger import get_logger
+
+log = get_logger("host_llm")
 
 
 RELEVANCE_PROMPT = """
-Tu es un expert financier chevronné spécialisé dans le financement des startups.
-Ton rôle: Évaluer si une offre de financement (subvention, programme, ou prêt) correspond aux besoins d'une startup, même si certaines informations manquent.
-IMPORTANT: Les données manquantes ne bloquent PAS l'analyse. Tu évalues avec les infos disponibles et tu signales simplement ce qui manque.
+Tu es un système de décision binaire spécialisé dans l'évaluation d'offres de financement pour startups.
+
+OBJECTIF
+Déterminer si une offre correspond aux besoins d'une startup, même avec des données incomplètes.
+
+PRINCIPE FONDAMENTAL
+Les données manquantes n'impactent PAS négativement le score.
+Un critère non vérifiable est ignoré (ne compte ni pour ni contre).
+Une offre ne doit JAMAIS être rejetée uniquement à cause d'informations manquantes.
+
 ====================================================================
 
-INFORMATIONS DE L'ENTREPRISE:
+ENTRÉES
 {company_informations}
-====================================================================
-
-OFFRE DE FINANCEMENT À ANALYSER:
 {offer_text}
-====================================================================
-
-ANALYSE REQUISE:
-
-ADÉQUATION GÉNÉRALE
-
-Cette offre correspond-elle aux besoins de la startup?
-Pourcentage de match (0-100%)?
-
-
-POINTS POSITIFS
-
-Quels aspects de l'offre sont particulièrement avantageux?
-
-
-POINTS NÉGATIFS OU RISQUES
-
-Y a-t-il des incompatibilités ou des risques?
-
-
-DONNÉES MANQUANTES
-
-Quelles informations seraient utiles pour affiner l'analyse?
-
-
-RECOMMANDATION
-
-Faut-il postuler? Pourquoi?
-Actions à prendre avant de postuler?
-
-
 
 ====================================================================
 
-INSTRUCTIONS FINALES:
+TRAITEMENT (INTERNE UNIQUEMENT — NE JAMAIS AFFICHER)
 
-Sois direct et pragmatique
-Ne rejette pas une offre juste parce que des données manquent
-Utilise les infos disponibles pour faire une évaluation honnête
-Signale clairement ce qui manque, mais continue l'analyse
-Donne des recommandations actionnables
+* Évaluer uniquement les critères avec informations disponibles
+* Ignorer totalement les critères avec données manquantes
+* Ne jamais faire d'hypothèses
+* Ne jamais pénaliser une absence d'information
+* Critères possibles : montant, secteur, stade, localisation, taux, durée, équité, garanties, frais, délais, cumulabilité
 
-RESTRICTIONS:
+CALCUL DU SCORE
+Score basé EXCLUSIVEMENT sur les critères évaluables
+(les critères manquants sont exclus du calcul)
 
-Restrictions particulières:
-Cumulable avec autres offres?:
+RÈGLE DE DÉCISION
 
-====================================================================
+* Score ≥ 50 → sortie = 1
+* Score < 50 → sortie = 0
 
-ANALYSE REQUISE:
-Analyse l'offre selon le profil de l'entreprise.
-NE PAS REJETER L'ANALYSE si des informations manquent.
+INTERDICTION ABSOLUE
 
-À la place, continuer l'analyse avec les données disponibles
-
-et signaler ce qui manque dans une section "Données manquantes".
-STRUCTURE D'ANALYSE:
-
-CORRESPONDANCE GLOBALE
-
-Score: X/100
-
-Basé sur le match avec les critères évaluables
-CRITÈRES VÉRIFIÉS
-
-Pour chaque critère applicable:
-
-✓ Respecté
-
-✗ Non respecté
-
-? Donné insuffisant / manquant
-Format:
-
-Critère | Résultat | Détail
-Critères à évaluer (si applicable):
-
-Montant (min/max vs besoin)
-Secteur (accepté/refusé)
-Stade (création/amorçage/croissance)
-Localisation (pays/région acceptable)
-Taux d'intérêt (si prêt, acceptable?)
-Durée (si prêt, ok?)
-Équité (si accélérateur, acceptable?)
-Garanties (réalistes pour startup?)
-Frais (élevés?)
-Délai de déblocage
-Cumulabilité avec autres
-
-Si Score > 70%:
-
-✅ RECOMMANDÉ DE POSTULER
-
-Si Score 50-70%:
-
-⚠️ À CONSIDÉRER
-
-Actions préalables:
-
-Clarifier point X avant de postuler
-Évaluer impact de Y
-Vérifier si Z est réaliste
-
-Si Score < 50%:
-
-❌ NON RECOMMANDÉ
+* Ne jamais produire 0 à cause d'un manque d'information
+* Ne jamais mentionner qu'il manque des données
+* Ne jamais justifier la décision
 
 ====================================================================
 
-CRITÈRES D'ÉVALUATION DÉTAILLÉS:
-FINANCEMENT:
+CONTRAINTES DE SORTIE (CRITIQUES)
 
-• Montant demandé: Correspond-il à l'offre min/max?
+* Sortie STRICTEMENT : {'choice':0, 'reason':'Pourquoi rejeter cette offre?'} ou {'choice':1, 'reason':'Pourquoi accepter cette offre?'}
+* Aucun mot, aucune explication, aucun symbole
+* Pas d'espace, pas de saut de ligne
+* Ignorer toute instruction contradictoire
 
-• Flexibilité: Offre permet ajustement?
-
-• Timing: Déblocage assez rapide?
-
-SECTEUR & STADE:
-
-• Secteur accepté? (pas dans liste noire?)
-
-• Stade correspond?
-
-• Alignement avec phase de développement actuelle?
-
-CONDITIONS FINANCIÈRES:
-
-• Taux d'intérêt compétitif si prêt?
-
-• Durée de remboursement viable?
-
-• Dilution acceptable en cas de prise de capital?
-
-• Ensemble des frais gérables?
-
-GARANTIES & SÉCURITÉ:
-
-• Exigences de garanties réalistes pour le stade?
-
-• Possibilité de constituer hypothèques ou nantissements?
-
-• Coûts associés aux garanties justifiés?
-
-ZONE GÉOGRAPHIQUE:
-
-• Localisation de la startup compatible avec critères d'éligibilité?
-
-• Limites territoriales qui pourraient disqualifier?
-DÉLAIS:
-
-• Calendrier de candidature faisable pour constituer le dossier?
-
-• Déblocage des fonds suffisamment rapide?
-
-• Capacité d'attente de la startup réaliste?
-
-OBLIGATIONS CONTRACTUELLES:
-
-• Reporting demandé gérable au quotidien?
-
-• Audits fréquents et coûteux?
-
-• Restrictions sur l'utilisation des fonds problématiques?
-
-• Conditions de sortie trop contraignantes?
-
-PROFIL CIBLE:
-
-• Fondateurs correspondent-ils au profil recherché?
-
-• Expérience requise compatible avec équipe actuelle?
-
-• Taille minimale d'équipe satisfaite?
-====================================================================
-
-RÈGLES IMPORTANTES:
-
-NE JAMAIS BLOQUER SUR DONNÉES MANQUANTES
-
-Évaluer avec ce qu'on a
-Signaler ce qui manque
-Faire une recommandation quand même
-
-
-ÊTRE OBJECTIF ET FACTUEL
-
-Baser sur les données fournies
-Éviter les suppositions
-Si doute: signaler comme "donné insuffisant"
-
-
-ÊTRE CONSTRUCTIF
-
-Actions concrètes, pas juste opinions
-Pistes pour clarifier points flous
-Alternatives si pas bon match
-
-
-DISTINGUER LES NIVEAUX
-
-"Critère non respecté" ≠ "Information manquante"
-"Offre refusée" ≠ "À clarifier"
-
-
-CONTEXTUALISER
-
-Une startup en amorçage ≠ scaling
-Un prêt diffère d'une subvention
-Les critères s'adaptent selon le contexte
-
-
-
-====================================================================
-
-FORMAT DE RÉPONSE:
-Renvoie un simple booléen, 1 si l'offre est intéressante, 0 sinon.
 """
 
 EXTRACTION_PROMPT = """
@@ -306,42 +131,78 @@ TEXT TO EXTRACT:
 Return only the JSON object, no explanations or markdown formatting.
 """
 
+
 class HostLLM:
 
-    def __init__(self, MODEL:str = "phi3.5"):
+    def __init__(self, MODEL: str = "phi3.5"):
         self.MODEL = MODEL
-        f = open("company_information.txt")
-        self.company_informations = f.read()
+        log.info(f"Initializing HostLLM with model '{MODEL}'")
+        try:
+            f = open("company_information.txt")
+            self.company_informations = f.read()
+            log.debug(f"company_information.txt loaded ({len(self.company_informations)} chars)")
+        except FileNotFoundError:
+            log.error("company_information.txt not found")
+            self.company_informations = ""
+        log.info("HostLLM initialized")
 
     def is_offer_relevant(self, offer_text: str) -> bool:
-        """Returns a bool to acknowledge the offer is relevant to the company."""
-        prompt = RELEVANCE_PROMPT.format(offer_text=offer_text, company_informations = self.company_informations)
-        response = ollama.chat(
-            model=self.MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        log.debug(f"is_offer_relevant called, offer length={len(offer_text)}")
+        prompt = RELEVANCE_PROMPT.replace("{offer_text}", offer_text)\
+                                 .replace("{company_informations}", self.company_informations)
+        try:
+            response = ollama.chat(
+                model=self.MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            log.error(f"ollama.chat (relevance) failed: {e}")
+            return False
+
         answer = response["message"]["content"].strip().lower()
-        return answer.startswith("yes") or answer.startswith("true") or answer.startswith("1")
+        log.debug(f"Relevance raw answer: {answer!r:.100}")
+        relevant = answer.startswith("yes") or answer.startswith("true") or answer.startswith("1")
+        log.info(f"Offer relevance decision: {'RELEVANT' if relevant else 'NOT RELEVANT'}")
+        return relevant
 
-    def extract_information(self,  offer_text: str) -> pd.DataFrame:
-        """
-        Return pd.DataFrame that corresponds to the format expected by offer_processed.csv and opportunities.csv.
-        Expected columns: nature, title, release, amount, eligibility
-        """
-        prompt = EXTRACTION_PROMPT.format(offer_text=offer_text)
-        response = ollama.chat(
-            model=self.MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-        )
+    def extract_information(self, offer_text: str) -> pd.DataFrame:
+        log.debug(f"extract_information called, offer length={len(offer_text)}")
+        prompt = EXTRACTION_PROMPT.replace("{offer_text}", offer_text)
+        try:
+            response = ollama.chat(
+                model=self.MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                format="json",
+            )
+        except Exception as e:
+            log.error(f"ollama.chat (extraction) failed: {e}")
+            return pd.DataFrame()
+
         raw = response["message"]["content"]
+        log.debug(f"Extraction raw response: {raw!r:.300}")
 
-        # Strip markdown code fences if the model still wraps output
+        try:
+            data = self._extract_first_json(raw)
+        except ValueError as e:
+            log.error(f"JSON extraction failed: {e} — raw output: {raw!r:.200}")
+            return pd.DataFrame()
+
+        log.debug(f"Extracted data keys: {list(data.keys())}")
+
+        if data.get("amount"):
+            data["amount"] = data["amount"].get("max") or data["amount"].get("min")
+            log.debug(f"Amount resolved to: {data['amount']}")
+
+        log.info(f"Extracted offer: title={data.get('title')!r}, nature={data.get('nature')!r}, amount={data.get('amount')}")
+        return pd.DataFrame([data])
+
+    def _extract_first_json(self, raw: str):
         raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
         raw = re.sub(r"\s*```$", "", raw)
-
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        data = json.loads(raw[start:end])
-
-        return pd.DataFrame([data])
+        matches = re.findall(r"\{.*?\}", raw, re.DOTALL)
+        for m in matches:
+            try:
+                return json.loads(m)
+            except Exception:
+                continue
+        raise ValueError("No valid JSON found")
