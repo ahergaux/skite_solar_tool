@@ -72,11 +72,11 @@ def main():
             urls_text = f.read()
         log.debug(f"to_check.txt content: {urls_text!r}")
         new_offers = mistral_client.query_for(urls_text)
-        if new_offers is None:
+        if not new_offers:
             log.info("Mistral returned no offers from scrap")
             scrap_new = 0
         else:
-            log.info(f"{len(new_offers)} new offers found via scrap")
+            log.info(f"{len(new_offers)} offers found via scrap")
             scrap_new = check.filter(new_offers)
         new_op += scrap_new
         log.info(f"Scrap processing done — {scrap_new} new opportunities from scrap")
