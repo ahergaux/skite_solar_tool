@@ -61,9 +61,12 @@ def main():
     log.info("Starting mail processing")
     mails = mail_client.get_all()
     log.info(f"{len(mails)} new offers found in mailbox")
-    mail_new = check.filter([f"{mail.header} - {mail.body}" for mail in mails])
+    mail_new = check.filter([f"{mail.header()} - {mail.body()}" for mail in mails])
     new_op += mail_new
     log.info(f"Mail processing done — {mail_new} new opportunities from mails")
+
+    if mails:
+        mail_client.move_to_treated()
 
     # --- Scrap ---
     log.info("Starting scrap processing")

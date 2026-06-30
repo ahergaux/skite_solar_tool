@@ -51,22 +51,41 @@ class iCloudConnection:
             if msg is None:
                 log.error(f"Failed to fetch message at index {i}: {self.imap.lastErrorText()}")
             else:
-                log.debug(f"Fetched message {i}: {getattr(msg, 'header', '(no header)')!r:.80}")
+                log.debug(f"Fetched message {i}: {msg.header()!r:.80}")
                 messages.append(msg)
         log.info(f"Fetched {len(messages)} messages")
         return messages
 
-    def move_to_inbox(self):
-        log.debug("Moving all messages to Inbox")
-        msgSet = self.imap.Search("ALL", True)
-        result = self.imap.CopyMultiple(msgSet, "Inbox")
-        if not result:
-            log.error("move_to_inbox failed")
-        else:
-            log.info("Messages moved to Inbox")
-        return result
+    def move_to_treated(self, target_mailbox: str = "Traités") -> bool:
+        """Move every message out of the working mailbox into target_mailbox.
 
-    # TODO: missing delete for the mailbox
+        This is a real move (copy + delete + expunge), so already-processed
+        mails are not re-fetched on the next run.
+        """
+        log.info(f"Moving processed messages to '{target_mailbox}'")
+
+        # Ensure the destination exists — ignore failure if it's already there
+        self.imap.CreateMailbox(target_mailbox)
+
+        msgSet = self.imap.Search("ALL", True)
+        if msgSet is None:
+            log.error(f"Search failed: {self.imap.lastErrorText()}")
+            return False
+
+        if not self.imap.CopyMultiple(msgSet, target_mailbox):
+            log.error(f"Copy to '{target_mailbox}' failed: {self.imap.lastErrorText()}")
+            return False
+
+        if not self.imap.SetMsgFlags(msgSet, "Deleted", True):
+            log.error(f"Marking messages as deleted failed: {self.imap.lastErrorText()}")
+            return False
+
+        if not self.imap.Expunge():
+            log.error(f"Expunge failed: {self.imap.lastErrorText()}")
+            return False
+
+        log.info(f"Messages moved to '{target_mailbox}'")
+        return True
 
     def __delete__(self, instance):
         log.debug("Disconnecting IMAP")

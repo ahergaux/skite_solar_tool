@@ -100,6 +100,13 @@ class ProcessCheck:
             log.error(f"Extraction returned empty DataFrame for offer {i + 1} — skipping")
             return 0
 
+        if self._is_blank(extracted.iloc[0]):
+            log.error(
+                f"Offer {i + 1}: extraction returned only null/empty fields — "
+                f"discarding without saving to CSV (raw offer: {str(offer)!r:.150})"
+            )
+            return 0
+
         with self._write_lock:
             already_known = self.match(extracted, self.opportunities)
 
@@ -118,6 +125,19 @@ class ProcessCheck:
 
         log.info(f"Offer {i + 1} is not relevant — not added to opportunities")
         return 0
+
+    @staticmethod
+    def _is_blank(row: pd.Series) -> bool:
+        """True if every field of the extracted row is null/None/empty."""
+        for v in row:
+            if v is None:
+                continue
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            if isinstance(v, (list, str)) and len(v) == 0:
+                continue
+            return False
+        return True
 
     def match(self, offer: pd.DataFrame, db: pd.DataFrame) -> bool:
         """Return True if the offer is already present in db."""
