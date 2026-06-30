@@ -46,7 +46,7 @@ class iCloudConnection:
         count = self.imap.get_NumMessages()
         log.debug(f"Fetching {count} messages from mailbox")
         messages = []
-        for i in range(1, count):
+        for i in range(1, count + 1):
             msg = self.imap.FetchSingle(i, True)
             if msg is None:
                 log.error(f"Failed to fetch message at index {i}")
